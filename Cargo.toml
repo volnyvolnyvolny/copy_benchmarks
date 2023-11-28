@@ -1,7 +1,7 @@
 [package]
-name = "rust_rotations"
-version = "0.2.0"
-authors = ["Valentin Vasilev <volnyvolnyvolny@ya.ru>"]
+name = "copy_benchmarks"
+version = "0.1.0"
+authors = ["Valentin Vasilev <3volny@gmail.com>"]
 edition = "2021"
 
 [dev-dependencies]
@@ -9,19 +9,11 @@ criterion = {version = "0.4", features = ["html_reports"]}
 regex = {version = "1.8", features = ["unicode-perl"]}
 
 [[bench]]
-name = "rotations"
-harness = false
-
-[[bench]]
 name = "copies"
 harness = false
 
-[[bench]]
-name = "swaps"
-harness = false
-
 [dependencies]
-gcd = "2.3.0"
+# gcd = "2.3.0"
 pprof = {version = "0.11.1", features =  ["flamegraph", "criterion"]}
 seq-macro = "0.3.3"
 

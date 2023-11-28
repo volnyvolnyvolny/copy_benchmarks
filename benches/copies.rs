@@ -20,13 +20,13 @@ MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
 CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
 TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO↓FTWARE.
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
 
 use criterion::{
     criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, BenchmarkId, Criterion,
 };
-use rust_rotations::utils::*;
+use fast_copy::*;
 
 use std::collections::HashMap;
 use std::ptr;
@@ -58,30 +58,22 @@ fn run_fun<const N: usize>(
     fun: &Fun,
 ) {
     match fun {
+        ByteCopy => {
+            group.bench_with_input(BenchmarkId::new("byte_copy", param), &param, |b, _| {
+                b.iter(|| unsafe { byte_copy::<[usize; N]>(arr, arr.offset(distance), len) })
+            });
+        }
         Copy => {
-            group.bench_with_input(BenchmarkId::new("utils::copy", param), &param, |b, _| {
+            group.bench_with_input(BenchmarkId::new("copy", param), &param, |b, _| {
                 b.iter(|| unsafe {
                     copy::<[usize; N]>(arr, arr.offset(distance), len);
                 })
             });
         }
         BlockCopy => {
-            group.bench_with_input(
-                BenchmarkId::new("utils::block_copy", param),
-                &param,
-                |b, _| {
-                    b.iter(|| unsafe { block_copy::<[usize; N]>(arr, arr.offset(distance), len) })
-                },
-            );
-        }
-        ByteCopy => {
-            group.bench_with_input(
-                BenchmarkId::new("utils::byte_copy", param),
-                &param,
-                |b, _| {
-                    b.iter(|| unsafe { byte_copy::<[usize; N]>(arr, arr.offset(distance), len) })
-                },
-            );
+            group.bench_with_input(BenchmarkId::new("block_copy", param), &param, |b, _| {
+                b.iter(|| unsafe { block_copy::<[usize; N]>(arr, arr.offset(distance), len) })
+            });
         }
         PtrCopy => {
             group.bench_with_input(BenchmarkId::new("ptr::copy", param), &param, |b, _| {
@@ -105,10 +97,10 @@ fn run_fun<const N: usize>(
 /// ```text
 ///   start, dist = 2
 ///   |               len = 4
-/// [ 1  2  3  4  5  6  7  8  9]
+/// [ 1  2  3  4  5  6  7]
 ///   [://////:]
 ///
-/// [ 1  2  1  2  3  4  7  8  9]
+/// [ 1  2  1  2  3  4  7]
 ///         [://////:]
 /// ```
 fn case_copy_overlapping<const N: usize>(c: &mut Criterion, len: usize, distances: &[isize]) {

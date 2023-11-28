@@ -20,555 +20,44 @@ MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
 CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
 TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO↓FTWARE.
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
 
 #![doc = include_str!("../README.md")]
 //#![feature(sized_type_properties)]
 
-use std::mem::MaybeUninit;
-//use std::mem::SizedTypeProperties;
-
-use std::cmp;
-
+use std::mem::size_of;
 use std::ptr;
+use std::ptr::copy_nonoverlapping;
 use std::slice;
 
-pub mod buf;
-pub use buf::*;
-
-pub mod utils;
-pub use utils::*;
-
-pub mod gm;
-pub use gm::*;
-
-/// # Edge case (optimal for left && right <= 2)
+/// # Reverse slice
 ///
-/// Rotates the range `[mid-left, mid+right)` such that the element
-/// at `mid` becomes the first element. Equivalently, rotates the range `left` elements
-/// to the left or `right` elements to the right.
-///
-/// This is the fastest way to calculate `left <= 2` and `right <= 2` edge cases.
+/// Reverse slice `[p, p+count)`.
 ///
 /// ## Safety
 ///
 /// The specified range must be valid for reading and writing.
+///
+/// ## Example
+///
+/// ```text
+///                 count = 7
+/// [ 1  2  3  4  5  6  7  8  9 10 11]  // reverse slice
+///            └─────────────────┘
+/// [ 1  .  3 10  9  8  7  6  5  4 11]
+/// ```
 #[inline(always)]
-pub unsafe fn ptr_edge_rotate<T>(left: usize, mid: *mut T, right: usize) {
-    if left == 0 || right == 0 {
-        return;
-    }
-
-    let start = mid.sub(left);
-    let end = mid.add(right - 1);
-
-    if left == 1 && right == 1 {
-        ptr::swap(start, mid);
-    } else if left == right {
-        ptr::swap_nonoverlapping(start, mid, right);
-    } else if left == 1 {
-        let tmp = start.read();
-
-        shift_left(1, mid, right);
-        end.write(tmp);
-    } else if left == 2 {
-        let (a, b) = (start.read(), start.add(1).read());
-
-        shift_left(left, mid, right);
-
-        end.sub(1).write(a);
-        end.write(b);
-    } else if right == 1 {
-        let tmp = mid.read();
-
-        shift_right(left, mid, right);
-        start.write(tmp);
-    } else if right == 2 {
-        let (a, b) = (mid.read(), mid.add(1).read());
-
-        shift_right(left, mid, right);
-
-        start.write(a);
-        start.add(1).write(b);
-    } else {
-        // fallback
-        stable_ptr_rotate(left, mid, right);
-    }
+pub unsafe fn reverse_slice<T>(p: *mut T, count: usize) {
+    let slice = slice::from_raw_parts_mut(p, count);
+    slice.reverse();
 }
 
-/// # ContrevB (Generalized conjoined triple reversal) rotation
+/// # Copy (overlapping)
 ///
-/// Rotates the range `[mid-left, mid+right)` such that the element at `mid` becomes the first
-/// element. Equivalently, rotates the range `left` elements to the left or `right` elements to the
-/// right.
+/// Copy region `[src, src + count)` to `[dst, dst + count)` element by element.
 ///
-/// ## Safety
-///
-/// The specified range must be valid for reading and writing.
-///
-/// ## Algorithm
-///
-/// It is the generalization of the Contrev rotation. Instead of moving separate elements we move
-/// blocks of elements.
-///
-/// When `gcd(left, right) = 1` it became the usual Contrev.
-///
-/// ## Example
-///
-/// Case: `left > rignt`, `9 > 6`:
-///
-/// ```text
-///                             mid
-///   ls-->          <--le      |rs--> <--re
-/// [ 1  2  3  4  5  6: 7  8  9 *a  b  c  d  e  f]  // (ls -> le -> re -> rs -> ls)
-///   |  |  |    ╭┈┈┈┈┈ |┈ |┈ |┈┈┴┈┈┴┈┈╯  |  |  |
-///   ╰──┴──┴────╮      ╰──┴──┴────╮┈┈┈┈┈┈┴┈┈┴┈┈╯
-///   ╭┈┈┈┈┈┈┈┈┈ ╰──────╮        | ╰──────╮
-///   ↓        ls       ↓        ↓re      ↓
-/// [ a ~~~ c  4  .  6  1 ~~~ 3  d  -  f  7 ~~~ 9]  // (ls,         re)
-///            |     |    ╭┈┈┈┈┈┈┴┈┈┴┈┈╯
-///            ╰──┴──┴────╮
-///            ╭┈┈┈┈┈┈┈┈┈ ╰──────╮
-///            ↓        ls       ↓re
-/// [ a ~~~ c  d ~~~ f: 1 ~~~ 3 *4 ~~~ 6  7 ~~~ 9]
-///
-/// [ A        B      : C      * D        E      ]
-/// [ D ~~~~~~ B        A ~~~~~~ E        C ~~~~ ]
-/// [ D ~~~~~~ E ~~~~~: A ~~~~~* B ~~~~~~ C ~~~~ ]
-/// ```
-///
-/// Case: `left > right`, `8 > 6`:
-///
-/// ```text
-///                          mid
-///   ls-->          <--le   |rs-->    <--re
-/// [ 1  2  3  4  5  6: 7  8 *a  b  c  d  e  f]  // (ls -> le -> re -> rs -> ls)
-///   |  |    ╭┈┈┈┈┈┈┈┈ |┈ |┈┈┴┈┈╯        |  |
-///   ╰──┴────╮         ╰──┴───────╮┈┈┈┈┈┈┴┈┈╯
-///   ╭┈┈┈┈┈┈ ╰─────────╮     |    ╰──────╮
-///   ↓     ls    le    ↓     ↓     re    ↓
-/// [ a  b  3  4  5  6  1  2  e  f  c  d  7  8]  // (ls,   le,   re)
-///         |  |  ╰──┤  ╭┈┈┈┈┈┈┈┈┈┈┈┴┈┈╯
-///         ╰──┴──╮  ╰──────────────╮
-///         ╭┈┈┈┈ |┈┈┈┈┈╯           |
-///         ↓     ↓ls         re    ↓
-/// [ a  b  c  d  3  4  1  2  e  f  5  6  7  8]  // (ls,         re)
-///               |  |      ╭┈┴┈┈╯
-///               ╰──┴──────| ╮
-///               ╭┈┈┈┈┈┈┈┈┈╯ |
-///               ↓           ↓
-/// [ a ~~~~~~ d  e  f  1  2  3  4  5 ~~~~~~~ 8]
-///
-/// [ A     B     C   : D   * E     F     G    ]
-/// [ E ~~~ B     C     A ~~~ G     F     D ~~~]
-/// [ E ~~~ F ~~~ B     A ~~~ G     C ~~~ D ~~~]
-/// [ E ~~~ F ~~~ G ~~~ A ~~~ B ~~~ C ~~~ D ~~~]
-/// ```
-///
-/// Case: `left > right`, `8 > 7`:
-///
-/// ```text
-///                         mid
-///   ls-->            <--le|rs-->          <--re
-/// [ 1  2  3  4  5  6  7: 8* a  b  c  d  e  f  g]  // (ls -> le -> re -> rs -> ls)
-///   ╰───────────╮        ╰┈┈┆ ┈┈┈┈┈┈┈┈┈┈┈┈┈┈╮ |
-///   ╭┈┈┈┈┈┈┈┈┈┈ ╰────────╮┈┈╯╭──────────────┆─╯
-///   ↓  sl            le  |   | sr         re┆
-/// [ a  2  .  .  .  .  7  1  g╯ b  .  .  .  f╰>8]  // (ls, le, re, rs)
-///      ╰────────╮     ╰┈┈┈┈┈┈┈┈┆ ┈┈┈┈┈┈┈┈╮ |
-///      ╭┈┈┈┈┈┈┈ ╰─────╮┈┈┈┈┈┈┈┈╯╭─────── ┆─╯
-///      ↓  s        e  |         | s     e┆
-/// [ a  b  3  .  .  6  2  1  g  f╯ c  .  e╰>7  8]  // (ls, le, re, rs)
-///         ╰─────╮  ╰┈┈┈┈┈┈┈┈┈┈┈┈┈┈┆ ┈┈╮ |
-///         ╭┈┈┈┈ ╰──╮┈┈┈┈┈┈┈┈┈┈┈┈┈┈╯╭─ ┆─╯
-///         ↓  s  e  |               | e┆
-/// [ a ~~~ c  4  5╮ 3  2  1  g  f  e╯ d╰>6 ~~~ 8]  // (ls, le,     rs)
-///            ╰──╮╰┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈╮ |
-///            ╭┈ |┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┆─╯
-///            ↓  sl-->         <--re┆
-/// [ a ~~~~~~ d  4  3  2  1  g  f  e╰>5 ~~~~~~ 8]  // (ls,     re)
-///               ╰┈┈╰┈┈╰┈╮┆╭┈╯┈┈╯┈┈╯
-///               ╭┈ ╭┈ ╭ ╰┆┈┈╮ ┈╮ ┈╮
-///               ↓  ↓  ↓  ↓  ↓  ↓  ↓
-/// [ a ~~~~~~~~~ e  f  g: 1* 2  3  4 ~~~~~~~~~ 8]
-/// ```
-pub unsafe fn ptr_block_contrev_rotate<T>(left: usize, mid: *mut T, right: usize) {
-    if left <= 2 || right <= 2 || left == right {
-        ptr_edge_rotate(left, mid, right);
-        return;
-    }
-
-    let block_size = gcd::binary_usize(left, right);
-
-    if block_size == 1 {
-        ptr_contrev_rotate(left, mid, right);
-    } else {
-        let (mut ls, mut le) = (mid.sub(left), mid.sub(block_size));
-        let (mut rs, mut re) = (mid, mid.add(right).sub(block_size));
-
-        let half_min = cmp::min(left, right) / block_size / 2;
-        let half_max = cmp::max(left, right) / block_size / 2;
-
-        for _ in 0..half_min {
-            // Permutation (ls, le, re, rs)
-            for _ in 0..block_size {
-                ls.write(rs.replace(re.replace(le.replace(ls.read()))));
-
-                ls = ls.add(1);
-                le = le.add(1);
-                rs = rs.add(1);
-                re = re.add(1);
-            }
-
-            le = le.sub(2 * block_size);
-            re = re.sub(2 * block_size);
-        }
-
-        if left > right {
-            for _ in 0..half_max - half_min {
-                // (ls, le, re)
-                for _ in 0..block_size {
-                    ls.write(re.replace(le.replace(ls.read())));
-
-                    ls = ls.add(1);
-                    le = le.add(1);
-                    re = re.add(1);
-                }
-
-                le = le.sub(2 * block_size);
-                re = re.sub(2 * block_size);
-            }
-        } else {
-            for _ in 0..half_max - half_min {
-                // (rs, re, ls)
-                for _ in 0..block_size {
-                    ls.write(rs.replace(re.replace(ls.read())));
-
-                    ls = ls.add(1);
-                    rs = rs.add(1);
-                    re = re.add(1);
-                }
-
-                re = re.sub(2 * block_size);
-            }
-        }
-
-        let center = (re.offset_from(ls).abs() / 2) as usize / block_size;
-
-        for _ in 0..center {
-            for _ in 0..block_size {
-                // (re, ls)
-                ls.write(re.replace(ls.read()));
-
-                ls = ls.add(1);
-                re = re.add(1);
-            }
-
-            re = re.sub(2 * block_size);
-        }
-    }
-}
-
-// unsafe fn print<T>(label: &str, mut p: *const T, size: usize)
-// where
-//     T: std::fmt::Debug,
-// {
-//     print!("{} [", label);
-
-//     for i in 0..size {
-//         if i == size - 1 {
-//             print!("{:?}", p.read());
-//         } else {
-//             print!("{:?} ", p.read());
-//             p = p.add(1);
-//         }
-//     }
-
-//     println!("]");
-// }
-
-/// # Triple reversal rotation
-///
-/// Rotates the range `[mid-left, mid+right)` such that the element at `mid` becomes the first
-/// element. Equivalently, rotates the range `left` elements to the left or `right` elements to the
-/// right.
-///
-/// ## Algorithm
-///
-/// 1. Reverse l-side;
-/// 2. reverse r-side;
-/// 3. revere all.
-///
-/// "This is an easy and reliable way to rotate in-place. You reverse the
-/// left side, next you reverse the right side, next you reverse the entire
-/// array. Upon completion the left and right block will be swapped. There's
-/// no known first publication, but it was prior to 1981." <<https://github.com/scandum/rotate>>
-///
-/// ## Safety
-///
-/// The specified range must be valid for reading and writing.
-///
-/// ## Example
-///
-/// ```text
-///                            mid
-///        left = 9            |    right = 6
-/// [ 1  2  3  4  5  6 :7  8  9*10 11 12 13 14 15]  // reverse left
-///   ↓  ↓  ↓  ↓  ↓  ↓  ↓  ↓  ↓
-/// [ 9  8  7  6  5  4  3  2  1 10 11 12 13 14 15]  // reverse right
-///                              ↓  ↓  ↓  ↓  ↓  ↓
-/// [ 9  8  7  6  5  4  3  2  1 15 14 13 12 11 10]  // reverse all
-///   ↓  ↓  ↓  ↓  ↓  ↓  ↓  ↓  ↓  ↓  ↓  ↓  ↓  ↓  ↓
-/// [10 11 12 13 14 15 :1  2  3* 4  5  6  7  8  9]
-/// ```
-pub unsafe fn ptr_reversal_rotate<T>(left: usize, mid: *mut T, right: usize) {
-    if right <= 2 || left <= 2 || left == right {
-        ptr_edge_rotate(left, mid, right);
-        return;
-    }
-
-    let start = mid.sub(left);
-
-    #[inline(always)]
-    unsafe fn reverse_slice<T>(p: *mut T, size: usize) {
-        if size <= 3 {
-            ptr::swap(p, p.add(size).sub(1));
-        } else {
-            let slice = slice::from_raw_parts_mut(p, size);
-            slice.reverse();
-        }
-    }
-
-    reverse_slice(start, left);
-    reverse_slice(mid, right);
-    reverse_slice(start, left + right);
-}
-
-/// # Triple block reversal rotation
-///
-/// Rotates the range `[mid-left, mid+right)` such that the element at `mid` becomes the first
-/// element. Equivalently, rotates the range `left` elements to the left or `right` elements to the
-/// right.
-///
-/// ## Algorithm
-///
-/// 0. Block size = GCD(left, right);
-/// 1. Reverse blocks of l-side;
-/// 2. reverse blocks of r-side;
-/// 3. revere all blocks.
-///
-/// "This is an easy and reliable way to rotate in-place. You reverse the
-/// left side, next you reverse the right side, next you reverse the entire
-/// array. Upon completion the left and right block will be swapped."
-///
-/// ## Safety
-///
-/// The specified range must be valid for reading and writing.
-///
-/// ## Example
-///
-/// ```text
-///                            mid
-///        left = 9            |    right = 6
-/// [ 1  2  3  4  5  6 :7  8  9* a  b  c  d  e  f]  // reverse left side blocks
-///   ↓        ↓        ↓
-/// [ 7  .  9  4  .  6  1 ~~~ 3  a  .  c  d  .  f]  // reverse right side blocks
-///                              ↓        ↓
-/// [ 7  .  9  4  .  6  1 ~~~ 3  d  .  f  a  .  c]  // reverse all blocks
-///   ↓        ↓                 ↓        ↓
-/// [ a ~~~ c  d ~~~ f  1 ~~~ 3  4 ~~~ 6  7 ~~~ 9]
-/// ```
-pub unsafe fn ptr_block_reversal_rotate<T>(left: usize, mid: *mut T, right: usize) {
-    if right <= 2 || left <= 2 || left == right {
-        ptr_edge_rotate(left, mid, right);
-        return;
-    }
-
-    let start = mid.sub(left);
-
-    let block_size = gcd::binary_usize(left, right);
-
-    if block_size == 1 {
-        ptr_reversal_rotate(left, mid, right);
-    } else {
-        #[inline(always)]
-        unsafe fn reverse<T>(p: *mut T, count: usize, block_size: usize) {
-            let mut start = p;
-            let mut end = p.add((count - 1) * block_size);
-
-            for _ in 0..count / 2 {
-                ptr::swap_nonoverlapping(start, end, block_size);
-                start = start.add(block_size);
-                end = end.sub(block_size);
-            }
-        }
-
-        reverse(start, left / block_size, block_size);
-        reverse(mid, right / block_size, block_size);
-        reverse(start, (left + right) / block_size, block_size);
-    }
-}
-
-/// # Successive aka Piston rotation (recursive variant)
-///
-/// Rotates the range `[mid-left, mid+right)` such that the element at `mid` becomes the first
-/// element. Equivalently, rotates the range `left` elements to the left or `right` elements to the
-/// right.
-///
-/// ## Algorithm
-///
-/// 1. Swap the smallest side to its place;
-/// 2. repeat for a smaller array.
-///
-/// "First described by *Gries and Mills* in *1981*, this rotation is very similar to
-/// the Gries-Mills rotation but performs non-linear swaps. It is implemented as
-/// the *Piston Rotation* in the benchmark, named after a loop optimization that
-/// removes up to `log n` branch mispredictions by performing both a left and
-/// rightward rotation in each loop." <<https://github.com/scandum/rotate>>
-///
-/// ## Properties
-///
-/// * During the computation `mid` is never shifted.
-///
-/// ## Safety
-///
-/// The specified range must be valid for reading and writing.
-///
-/// ## Example
-///
-/// ```text
-///                            mid
-///           left = 9         |    right = 6
-/// [ 1  2  3  4  5  6: 7  8  9*10 11 12 13 14 15]  // swap
-///   └──────────────┴─────/\────┴──────────────┘
-///   ┌──────────────┬─────~/────┬──────────────┐
-/// [10 ~~~~~~~~~~~ 15: 7  .  9  1  -  -  -  -  6]
-///
-///                      l = 3        r = 6
-///  10  .  .  .  . 15[ 7  .  9* 1  -  3: 4  -  6]  // swap
-///                     └─────┴────/\─────┴─────┘
-///                     ┌─────┬────\~─────┬─────┐
-///  10  .  .  .  . 15[ 4  -  6  1  -  3  7 ~~~ 9]
-///
-///                       l = 3   r = 3
-///  10  .  .  .  . 15[ 4  -  6; 1  -  3] 7 ~~~ 9   // swap
-///                     └─────┴/\┴─────┘
-///                     ┌─────┬~~┬─────┐
-///  10  .  .  .  . 15[ 1 ~~~ 3  4 ~~~ 6] 7 ~~~ 9
-///
-/// [10  .  .  .  . 15: 1 ~~~ 3* 4 ~~~~~~~~~~~~ 9]
-/// ```
-pub unsafe fn ptr_piston_rotate_rec<T>(left: usize, mid: *mut T, right: usize) {
-    if left <= 2 || right <= 2 || left == right {
-        ptr_edge_rotate(left, mid, right);
-        return;
-    }
-
-    let start = mid.sub(left);
-
-    if left < right {
-        ptr::swap_nonoverlapping(start, start.add(right), left);
-        ptr_piston_rotate_rec(left, mid, right - left);
-    } else {
-        ptr::swap_nonoverlapping(mid, start, right);
-        ptr_piston_rotate_rec(left - right, mid, right);
-    }
-}
-
-/// # Successive aka Piston rotation
-///
-/// Rotates the range `[mid-left, mid+right)` such that the element at `mid` becomes the first
-/// element. Equivalently, rotates the range `left` elements to the left or `right` elements to the
-/// right.
-///
-/// ## Algorithm
-///
-/// 1. Swap the smallest side to its place;
-/// 2. repeat for a smaller array.
-///
-/// "First described by *Gries and Mills* in *1981*, this rotation is very similar to
-/// the *Gries-Mills rotation* but performs non-linear swaps. It is implemented as
-/// the *Piston rotation* in the benchmark, named after a loop optimization that
-/// removes up to `log n` branch mispredictions by performing both a left and
-/// rightward rotation in each loop." <<https://github.com/scandum/rotate>>
-///
-/// ## Properties
-///
-/// * During computation `mid` is never shifted.
-///
-/// ## Safety
-///
-/// The specified range must be valid for reading and writing.
-///
-/// # Example
-///
-/// ```text
-///                            mid
-///           left = 9         |    right = 6
-/// [ 1  2  3  4  5  6: 7  8  9*10 11 12 13 14 15]  // swap
-///   └──────────────┴─────/\────┴──────────────┘
-///   ┌──────────────┬─────~/────┬──────────────┐
-/// [10 ~~~~~~~~~~~ 15: 7  .  9  1  -  -  -  -  6]
-///
-///                       l = 3        r = 6
-///  10  .  .  .  . 15[ 7  .  9* 1  -  3: 4  -  6]  // swap
-///                     └─────┴─────/\────┴─────┘
-///                     ┌─────┬─────\~────┬─────┐
-///  10  .  .  .  . 15[ 4  -  6  1  -  3  7 ~~~ 9]
-///
-///                       l = 3   r = 3
-///  10  .  .  .  . 15[ 4  -  6; 1  -  3] 7  .  9   // swap
-///                     └─────┴/\┴─────┘
-///                     ┌─────┬~~┬─────┐
-///  10  .  .  .  . 15[ 1 ~~~ 3  4 ~~~ 6] 7  .  9
-///
-/// [10  .  .  .  . 15: 1  .  3* 4  .  .  .  .  9]
-/// ```
-pub unsafe fn ptr_piston_rotate<T>(mut left: usize, mid: *mut T, mut right: usize) {
-    loop {
-        if left <= 2 {
-            break;
-        }
-
-        while left <= right {
-            ptr::swap_nonoverlapping(mid.sub(left), mid.add(right - left), left);
-            right -= left;
-        }
-
-        if right <= 2 {
-            break;
-        }
-
-        while left >= right {
-            ptr::swap_nonoverlapping(mid, mid.sub(left), right);
-            left -= right;
-        }
-    }
-
-    if left <= 2 || right <= 2 {
-        ptr_edge_rotate(left, mid, right);
-    }
-}
-
-/// # Helix rotation
-///
-/// Rotates the range `[mid-left, mid+right)` such that the element at `mid` becomes the first
-/// element. Equivalently, rotates the range `left` elements to the left or `right` elements to the
-/// right.
-///
-/// ## Algorithm
-///
-/// "The helix rotation has similarities with the *Gries-Mills
-/// rotation* but has a distinct sequential movement pattern. It is
-/// an improvement upon the *Grail rotation* by merging the two inner
-/// loops into a single loop, significantly improving performance when
-/// the relative size difference between the two halves is large. In
-/// addition it doesn't stop when the smallest block no longer fits,
-/// but continues and recalculates the left or right side. The utilization
-/// of the merged loops is counter-intuitive and is likely novel. Its
-/// first known publication was in *2021* by *Control* from the *Holy Grail
-/// Sort Project*." <<https://github.com/scandum/rotate>>
+/// Regions could overlap.
 ///
 /// ## Safety
 ///
@@ -577,80 +66,66 @@ pub unsafe fn ptr_piston_rotate<T>(mut left: usize, mid: *mut T, mut right: usiz
 /// ## Examples
 ///
 /// ```text
-///                            mid
-///           left = 9         |    right = 6
-/// [ 1  2  3  4  5  6: 7  8  9* a  b  c  d  e  f]  // swap <--
-///   └─────────────────|─/\──┘                 |
-///                     └─\/────────────────────┘
-/// [ d  .  f  a  .  c  1 ~~~~~~~~~~~~~~~~~~~~~ 9]
-/// [ d  .  f:*a  .  c] 1 ~~~~~~~~~~~~~~~~~~~~~ 9   // swap equal
-///   a ~~~ c:*d ~~~ f  1 ~~~~~~~~~~~~~~~~~~~~~ 9
-///```
+///      dst      src   count = 7
+/// [ 1 :2  3  4 *A  B  C  D  E  F  G 12]  // copy -->
+///      |        └────────|────────┘
+///      └─────────────────┘
+/// [ 1 :A  .  . *D  .  .  G  E  .  G 12]
+/// ```
 ///
 /// ```text
-///                         mid
-///          left = 8       |      right = 7
-/// [ 1  2  3  4  5  6  7: 8* a  b  c  d  e  f  g]  // swap <--
-///   └────────────────/\──|                    |
-///                    \/  └────────────────────┘
-/// [ g *a  -  -  -  - :f] 1 ~~~~~~~~~~~~~~~~~~ 8   // ptr_edge_rotate
-/// [ a *b ~~~~~~~~~ f :g] 1  .  .  .  .  .  .  8
+///      src      dst    count = 7
+/// [ 1 *A  B  C :D  E  F  G 11 12 13 12]  // copy <--
+///      └─────── |────────┘        |
+///               └─────────────────┘
+/// [ 1 *A  .  C :A  .  .  .  .  .  G 12]
 /// ```
-pub unsafe fn ptr_helix_rotate<T>(mut left: usize, mut mid: *mut T, mut right: usize) {
-    let mut start = mid.sub(left);
-    let mut end = mid.add(right);
+pub unsafe fn copy<T>(src: *const T, dst: *mut T, count: usize) {
+    #[inline(always)]
+    unsafe fn _copy<T>(src: *const T, dst: *mut T, i: usize) {
+        // SAFE: By precondition, `i` is in-bounds because it's below `count`
+        let src = unsafe { src.add(i) };
 
-    loop {
-        if left >= right {
-            if right <= 2 || left == right {
-                break;
-            }
+        // SAFE: By precondition, `i` is in-bounds because it's below `count`
+        let dst = unsafe { &mut *dst.add(i) };
 
-            swap_backward(start, end.sub(left), left);
-
-            left %= right;
-            end = end.sub(left);
-            mid = start.add(left);
-            right -= left;
-        } else {
-            if left <= 2 || left == right {
-                break;
-            }
-
-            swap_forward(mid, start, right);
-
-            start = start.add(right);
-            right %= left;
-            mid = end.sub(right);
-            left -= right;
-        }
+        ptr::write(dst, ptr::read(src));
     }
 
-    if left <= 2 || right <= 2 || left == right {
-        ptr_edge_rotate(left, mid, right);
+    if src == dst {
+        return;
+    } else if src > dst {
+        for i in 0..count {
+            _copy(src, dst, i);
+        }
+    } else {
+        for i in (0..count).rev() {
+            _copy(src, dst, i);
+        }
     }
 }
 
-/// # Direct aka Juggling aka Dolphin rotation
+/// # Copy (overlapping)
 ///
-/// Rotates the range `[mid-left, mid+right)` such that the element at
-/// `mid` becomes the first element. Equivalently, rotates the range
-/// `left` elements to the left or `right` elements to the right.
+/// Copy region `[src, src + count)` to `[dst, dst + count)` byte by byte.
 ///
-/// ## Algorithm
+/// Regions could overlap.
 ///
-/// "In Rust this algorithm is used for small values of `left + right` or for large `T`. The elements
-/// are moved into their final positions one at a time starting at `mid - left` and advancing by `right`
-/// steps modulo `left + right`, such that only one temporary is needed. Eventually, we arrive back at
-/// `mid - left`. However, if `gcd(left + right, right)` is not 1, the above steps skipped over
-/// elements."
+/// ## Safety
 ///
-/// "Fortunately, the number of skipped over elements between finalized elements is always equal, so
-/// we can just offset our starting position and do more rounds (the total number of rounds is the
-/// `gcd(left + right, right)` value). The end result is that all elements are finalized once and
-/// only once."
+/// The specified range must be valid for reading and writing.
+pub unsafe fn byte_copy<T>(src: *const T, dst: *mut T, count: usize) {
+    let src = src.cast::<u8>();
+    let dst = dst.cast::<u8>();
+
+    copy(src, dst, count * size_of::<T>());
+}
+
+/// # Copy (overlappihg)
 ///
-/// Its first known publication was in *1966*.
+/// Copy region `[src, src + count)` to `[dst, dst + count)` block by block.
+///
+/// Regions could overlap.
 ///
 /// ## Safety
 ///
@@ -659,652 +134,119 @@ pub unsafe fn ptr_helix_rotate<T>(mut left: usize, mut mid: *mut T, mut right: u
 /// ## Example
 ///
 /// ```text
-///                            mid
-///           left = 9         |    right = 6
-/// [ 1  2  3  4  5  6: 7  8  9*10 11 12 13 14 15]
-///   |        |        |        |        └──────────────────╮
-///   |        |        |        └──────────────────╮        ┆
-///   |        |        └─────────────────┐         ┆        ┆
-///   |        └─────────────────┐        ┆         ┆        ┆
-///   └─────────────────┐        ┆        ┆         ┆        ┆
-/// ~──────────╮        ┆        ┆        ┆         ┆        ┆
-/// ~─╮        ┆        ┆        ┆        ┆         ┆        ┆
-///   ↓        ↓        ↓        ↓        ↓         ↓        ↓
-/// [10  2  3 13  5  6  1  8  9  4 11 12  7 14 15][10  2  3 13...
-///      |        |        |        |        └──────────────────╮
-///      |        |        |        └──────────────────╮        ┆
-///      |        |        └─────────────────┐         ┆        ┆
-///      |        └─────────────────┐        ┆         ┆        ┆
-///      └─────────────────┐        ┆        ┆         ┆        ┆
-/// ~─────────────╮        ┆        ┆        ┆         ┆        ┆
-/// ~────╮        ┆        ┆        ┆        ┆         ┆        ┆
-///   _  ↓     _  ↓     _  ↓     _  ↓     _  ↓      _  ↓     _  ↓
-/// [10 11  3 13 14  6  1  2  9  4  5 12  7  8 15][10 11  3 13 14...
-///         |        |        |        |        └──────────────────╮
-///         |        |        |        └──────────────────╮        ┆
-///         |        |        └─────────────────┐         ┆        ┆
-///         |        └─────────────────┐        ┆         ┆        ┆
-///         └─────────────────┐        ┆        ┆         ┆        ┆
-/// ~────────────────╮        ┆        ┆        ┆         ┆        ┆
-/// ~───────╮        ┆        ┆        ┆        ┆         ┆        ┆
-///   _  _  ↓  _  _  ↓  _  _  ↓  _  _  ↓  _  _  ↓   _  _  ↓  _  _  ↓
-/// [10  . 12  .  . 15: .  .  3* .  .  6  .  .  9][ .  . 12  .  . 15...
+///      src      dst    count = 13
+/// [ 1 *A  B  C :D  E  F  G  H  I  J  K  L  M 15 16 17 18]  // copy block(3) <--
+///      └─────── | ─────────────────────────┘        |
+///               └───────────────────────────────────┘
+/// [ 1  A  B  .  D  E  .  G  H  .  J  K  .  M  K  .  M 18]  // copy block
+/// [ 1  .  .  .  .  E  .  G  H  .  J  H  .  .  .  .  M 18]  // copy block
+/// [ 1  .  B  .  D  E  .  G  E  .  .  .  .  .  .  .  M 18]  // copy block
+/// [ 1  .  B  .  D  B  .  .  .  .  .  .  .  .  .  .  M 18]  // copy rem(1)
+/// [ 1 *A  B  C :A  .  .  .  .  .  .  .  .  .  .  .  M 18]
 /// ```
+pub unsafe fn block_copy<T>(src: *const T, dst: *mut T, count: usize) {
+    let block_size = dst.offset_from(src).unsigned_abs();
+
+    if src == dst {
+        return;
+    } else if block_size == 1 {
+        copy(src, dst, count);
+    } else if block_size > count {
+        copy_nonoverlapping(src, dst, count);
+    } else {
+        let mut s = src;
+        let mut d = dst;
+
+        let rounds = count / block_size + 1;
+        let rem = count % block_size;
+
+        if src < dst {
+            s = src.add(count);
+            d = dst.add(count);
+
+            for _ in 1..rounds {
+                s = s.sub(block_size);
+                d = d.sub(block_size);
+
+                copy_nonoverlapping(s, d, block_size);
+            }
+
+            s = s.sub(rem);
+            d = d.sub(rem);
+            copy_nonoverlapping(s, d, rem);
+        } else {
+            for _ in 1..rounds {
+                copy_nonoverlapping(s, d, block_size);
+
+                s = s.add(block_size);
+                d = d.add(block_size);
+            }
+
+            s = s.add(1);
+            d = d.add(1);
+            copy_nonoverlapping(s, d, rem);
+        }
+    }
+}
+
+/// # Shift left
+///
+/// Copy region `[mid, mid + count)` to `[mid - left, mid - left + count)`
+/// element by element, via byte_copy or std::ptr::copy.
+///
+/// ## Safety
+///
+/// * The region `[mid       , mid        + count)` must be valid for reading;
+/// * the region `[mid - left, mid - left + count)` must be valid for writing.
+///
+/// ## Example
 ///
 /// ```text
-///                            mid
-///           left = 9         |    right = 6
-/// [ 1  2  3  4  5  6: 7  8  9* a  b  c  d  e  f]
-///   └─────|  └─────|  └─────|  └─────|  └─────|
-///  ~╮     └───────────╮     |        └────────────╮
-///   |              |  |     └───────────╮     |   |
-///  ~| ───────╮     └───────────╮        |     └───| ───────╮
-///   ↓        ↓        ↓        ↓        ↓         ↓        ↓
-/// [ a ~~~ c  d ~~~ f  1 ~~~ 3  4 ~~~ 6  7 ~~~ 9][ a ~~~ c  d ~~~ f...
+///       <<mid, left = 1, count = 7
+/// [ 1 :2 *A  B  C  D  E  F  G 10]
+///         └─────────────────┘
+/// [ 1 :A *B  .  .  .  .  G  G 10]
 /// ```
-pub unsafe fn ptr_direct_rotate<T>(left: usize, mid: *mut T, right: usize) {
-    // N.B. the below algorithms can fail if these cases are not checked
-    if right <= 2 || left <= 2 {
-        ptr_edge_rotate(left, mid, right);
-        return;
-    }
-
+pub unsafe fn shift_left<T>(left: usize, mid: *mut T, count: usize) {
     let start = mid.sub(left);
 
-    if left == right {
-        ptr::swap_nonoverlapping(start, mid, left);
-        return;
-    }
-
-    // beginning of first round
-    let mut tmp: T = start.read();
-    let mut i = right;
-
-    // `gcd` can be found before hand by calculating `gcd(left + right, right)`,
-    // but it is faster to do one loop which calculates the gcd as a side effect, then
-    // doing the rest of the chunk
-    let mut gcd = right;
-
-    // benchmarks reveal that it is faster to swap temporaries all the way through instead
-    // of reading one temporary once, copying backwards, and then writing that temporary at
-    // the very end. This is possibly due to the fact that swapping or replacing temporaries
-    // uses only one memory address in the loop instead of needing to manage two.
-    loop {
-        std::mem::swap(&mut tmp, &mut *start.add(i));
-        // tmp = start.add(i).replace(tmp);
-
-        // instead of incrementing `i` and then checking if it is outside the bounds, we
-        // check if `i` will go outside the bounds on the next increment. This prevents
-        // any wrapping of pointers or `usize`.
-        if i >= left {
-            i -= left;
-            if i == 0 {
-                // end of first round
-                start.write(tmp);
-                break;
-            }
-            // this conditional must be here if `left + right >= 15`
-            if i < gcd {
-                gcd = i;
-            }
-        } else {
-            i += right;
-        }
-    }
-
-    // finish the chunk with more rounds
-    for s in 1..gcd {
-        tmp = start.add(s).read();
-        i = s + right;
-
-        loop {
-            std::mem::swap(&mut tmp, &mut *start.add(i));
-            // tmp = start.add(i).replace(tmp);
-            if i >= left {
-                i -= left;
-                if i == s {
-                    start.add(s).write(tmp);
-                    break;
-                }
-            } else {
-                i += right;
-            }
-        }
+    if size_of::<T>() == size_of::<usize>() && count >= 15 {
+        byte_copy(mid, start, count);
+    } else if size_of::<T>() < 15 * size_of::<usize>() {
+        copy(mid, start, count);
+    } else {
+        ptr::copy(mid, start, count);
     }
 }
 
-/// # Contrev (Conjoined triple reversal) rotation
+/// # Shift right
 ///
-/// Rotates the range `[mid-left, mid+right)` such that the element at `mid` becomes the first
-/// element. Equivalently, rotates the range `left` elements to the left or `right` elements to the
-/// right.
+/// Copy region `[mid - count, mid)` to `[mid - count + right, mid + right)`
+/// element by element, via byte_copy or std::ptr::copy.
 ///
 /// ## Safety
 ///
-/// The specified range must be valid for reading and writing.
-///
-/// ## Algorithm
-///
-/// "The conjoined triple reversal is derived from the triple reversal rotation. Rather than three
-/// separate reversals it conjoins the three reversals, improving locality and reducing
-/// the number of moves. Its first known publication was in 2021 by Igor van den
-/// Hoven." <<https://github.com/scandum/rotate>>
+/// * The region `[mid - count        , mid)` must be valid for reading;
+/// * the region `[mid - count + right, mid + right)` must be valid for writing.
 ///
 /// ## Example
 ///
-/// Case: `right > left`, `9 - 6`.
-///
 /// ```text
-///                            mid
-///   ls-->               <--le|rs-->       <--re
-/// [ 1  2  3  4  5  6: 7  8  9* a  b  c  d  e  f]  // (ls -> le -> re -> rs -> ls)
-///   ╰───────────╮           ╰┈┈┆ ┈┈┈┈┈┈┈┈┈┈┈╮ |
-///   ╭┈┈┈┈┈┈┈┈┈┈ ╰───────────╮┈┈╯╭────────── ┆─╯
-///   ↓  ls               le  |   | rs      re┆
-/// [ a  2  .  .  .  .  .  8  1  f╯ b  .  .  e╰>9]  // (ls, le, re, rs)
-///      ╰────────╮        ╰┈┈┈┈┈╭┈┈╯ ┈┈┈┈┈╮ |
-///      ╭┈┈┈┈┈┈┈ ╰────────╮┈┈┈┈┈╯  ╭───── ┆─╯
-///      ↓  s           e  |        |  s  e┆
-/// [ a  b  3  .  .  .  7  2  1  f  e  c  d╰>8  9]
-///         ╰─────╮     ╰┈┈┈┈┈┈┈┈┈┈┈┈┈╭╯  |
-///         ╭┈┈┈┈ ╰─────╮┈┈┈┈┈┈┈┈┈┈┈┈┈╯╭|─╯
-///         ↓  s     e  |              e┆
-/// [ a ~~~ c  4  .  6  3  2  1  f  e  d╰>7 ~~~ 9]  // (ls, le, re    )
-///            ╰──╮  ╰┈┈┈┈┈┈┈┈┈┈┈┈┈┈╭┈┈╯
-///            ╭┈ ╰──╮┈┈┈┈┈┈┈┈┈┈┈┈┈┈╯┆
-///            ↓  ls-->         <--re┆
-/// [ a ~~~~~~ d  5  4  3  2  1  f  e╰>6 ~~~~~~ 9]  // (ls,     re)
-///               ╰┈┈╰┈┈╰┈╮┆╭┈╯┈┈╯┈┈╯
-///               ╭┈ ╭┈ ╭ ╰┆┈┈╮ ┈╮ ┈╮
-///               ↓  ↓  ↓  ↓  ↓  ↓  ↓
-/// [ a ~~~~~~~~~ e  f: 1  2  3* 4  5 ~~~~~~~~~ 9]
+///   count = 7
+///      mid, right = 1>>
+/// [ 1 *A :B  C  D  E  F  G 11 12]
+///      └─────────────────┘
+/// [ 1 *A :A  .  .  .  .  F  G 12]
 /// ```
-///
-/// Case: `left < right`, `6 - 9`.
-///
-/// ```text
-///                   mid
-///   ls-->      <--le|rs-->                <--re
-/// [ a  b  c  d  e  f* 1  2  3: 4  5  6  7  8  9]  // (ls -> le -> re -> rs -> ls)
-///   | ╭┈┈┈┈┈┈┈┈┈┈┈ ┆┈┈╯           ╭───────────╯
-///   ╰─┆ ──────────╮╰┈┈╭───────────╯ ┈┈┈┈┈┈┈┈┈┈╮
-///     ┆ls      le |   |  rs               re  ↓
-/// [ 1<╯b  .  .  e ╰a  9  2  .  .  .  .  .  8  f]  // (ls, le, re, rs)
-///      | ╭┈┈┈┈┈ ┆┈┈┈┈┈┈┈┈╯        ╭────────╯
-///      ╰─┆ ───╮ ╰┈┈┈┈┈┈┈┈╭────────╯ ┈┈┈┈┈┈┈╮
-///        ┆s  e|          |  s           e  ↓
-/// [ 1  2<╯c  d╰~b  a  9  8  3  .  .  .  7  e  f]
-///         |╭ ┆┈┈┈┈┈┈┈┈┈┈┈┈┈┈╯     ╭─────╯
-///         ╰┆╮╰┈┈┈┈┈┈┈┈┈┈┈┈┈┈╭─────╯ ┈┈┈┈╮
-///          ┆┆s              |  s     e  ↓
-/// [ 1 ~~~ 3╯╰c  b  a  9  8  7  4  5  6  d ~~~ f]  // (ls,     re, rs)
-///            ╰┈╮┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈╯  ╭──╯
-///             ┆╰┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈╭──╯ ─╮
-///             ┆ ls-->         <--re  ↓
-/// [ 1 ~~~~~~ 4╯ b  a  9  8  7  6  5  c ~~~~~~ f]  // (ls,     re)
-///               ╰┈┈╰┈┈╰┈╮┆╭┈╯┈┈╯┈┈╯
-///               ╭┈ ╭┈ ╭ ╰┆┈┈╮ ┈╮ ┈╮
-///               ↓  ↓  ↓  ↓  ↓  ↓  ↓
-/// [ 1 ~~~~~~~~~ 5  6  7  8  9: a  b ~~~~~~~~~ f]
-/// ```
-///
-/// Case: `left > right`, `8 - 7`.
-///
-/// ```text
-///                         mid
-///   ls-->            <--le|rs-->          <--re
-/// [ 1  2  3  4  5  6  7: 8* a  b  c  d  e  f  g]  // (ls -> le -> re -> rs -> ls)
-///   ╰───────────╮        ╰┈┈┆ ┈┈┈┈┈┈┈┈┈┈┈┈┈┈╮ |
-///   ╭┈┈┈┈┈┈┈┈┈┈ ╰────────╮┈┈╯╭──────────────┆─╯
-///   ↓  ls            le  |   | rs         re┆
-/// [ a  2  .  .  .  .  7  1  g╯ b  .  .  .  f╰>8]  // (ls, le, re, rs)
-///      ╰────────╮     ╰┈┈┈┈┈┈┈┈┆ ┈┈┈┈┈┈┈┈╮ |
-///      ╭┈┈┈┈┈┈┈ ╰─────╮┈┈┈┈┈┈┈┈╯╭─────── ┆─╯
-///      ↓  s        e  |         | s     e┆
-/// [ a  b  3  .  .  6  2  1  g  f╯ c  .  e╰>7  8]  // (ls, le, re, rs)
-///         ╰─────╮  ╰┈┈┈┈┈┈┈┈┈┈┈┈┈┈┆ ┈┈╮ |
-///         ╭┈┈┈┈ ╰──╮┈┈┈┈┈┈┈┈┈┈┈┈┈┈╯╭─ ┆─╯
-///         ↓  s  e  |               | e┆
-/// [ a ~~~ c  4  5╮ 3  2  1  g  f  e╯ d╰>6 ~~~ 8]  // (ls, le,     rs)
-///            ╰──╮╰┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈╮ |
-///            ╭┈ |┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┆─╯
-///            ↓  ls-->         <--re┆
-/// [ a ~~~~~~ d  4  3  2  1  g  f  e╰>5 ~~~~~~ 8]  // (ls,     re)
-///               ╰┈┈╰┈┈╰┈╮┆╭┈╯┈┈╯┈┈╯
-///               ╭┈ ╭┈ ╭ ╰┆┈┈╮ ┈╮ ┈╮
-///               ↓  ↓  ↓  ↓  ↓  ↓  ↓
-/// [ a ~~~~~~~~~ e  f  g: 1* 2  3  4 ~~~~~~~~~ 8]
-/// ```
-pub unsafe fn ptr_contrev_rotate<T>(left: usize, mid: *mut T, right: usize) {
-    if left <= 2 || right <= 2 {
-        ptr_edge_rotate(left, mid, right);
-        return;
-    }
+pub unsafe fn shift_right<T>(count: usize, mid: *mut T, right: usize) {
+    let start = mid.sub(count);
 
-    if left == right {
-        ptr::swap_nonoverlapping(mid, mid.sub(left), right);
+    if size_of::<T>() == size_of::<usize>() && count >= 200 {
+        byte_copy(start, start.add(right), count);
+    } else if size_of::<T>() < 10 * size_of::<usize>() {
+        copy(start, start.add(right), count);
     } else {
-        let (mut ls, mut le) = (mid.sub(left), mid.sub(1));
-        let (mut rs, mut re) = (mid, mid.add(right).sub(1));
-
-        let half_min = cmp::min(left, right) / 2;
-        let half_max = cmp::max(left, right) / 2;
-
-        for _ in 0..half_min {
-            // Permutation (ls, le, re, rs)
-            ls.write(rs.replace(re.replace(le.replace(ls.read()))));
-            ls = ls.add(1);
-            le = le.sub(1);
-            rs = rs.add(1);
-            re = re.sub(1);
-        }
-
-        if left > right {
-            for _ in 0..half_max - half_min {
-                // (ls, le, re)
-                ls.write(re.replace(le.replace(ls.read())));
-                ls = ls.add(1);
-                le = le.sub(1);
-                re = re.sub(1);
-            }
-        } else {
-            for _ in 0..half_max - half_min {
-                // (rs, re, ls)
-                ls.write(rs.replace(re.replace(ls.read())));
-                ls = ls.add(1);
-                rs = rs.add(1);
-                re = re.sub(1);
-            }
-        }
-
-        // for _ in 0..re.offset_from(ls).abs() / 2 { // (re, ls)
-        // ls.write(
-        // re.replace(ls.read())
-        // );
-        // ls = ls.add(1);
-        // re = re.sub(1);
-        // }
-
-        let center = slice::from_raw_parts_mut(ls, re.offset_from(ls).unsigned_abs() + 1);
-        center.reverse();
-    }
-}
-
-// /// # Harmony rotation
-// ///
-// /// Rotates the range `[mid-left, mid+right)` such that the element at `mid` becomes the first
-// /// element. Equivalently, rotates the range `left` elements to the left or `right` elements to the
-// /// right.
-// ///
-// /// ## Safety
-// ///
-// /// The specified range must be valid for reading and writing.
-// ///
-// /// ## Algorithm
-// ///
-// /// `size_of(T) <= 1 * usize' case:
-// ///
-// /// Depending of the size:
-// ///
-// /// * For the array with `<= 14` elements (`size_of(T) <= 1 * usize') we use *direct rotation*;
-// ///
-// /// * `> 14` elements:
-// /// ** `left < right` the *reversal rotation is used*;
-// /// ** otherwise, *direct rotation*.
-// ///
-// /// * `> 20` elements we use *reversal rotation*.
-// ///
-// /// *Algorithm 1* (*Direct*) is used for small values of `left + right` or for large `T`. The elements
-// /// are moved into their final positions one at a time starting at `mid - left` and advancing by `right`
-// /// steps modulo `left + right`, such that only one temporary is needed. Eventually, we arrive back at
-// /// `mid - left`. However, if `gcd(left + right, right)` is not 1, the above steps skipped over
-// /// elements. For example:
-// ///
-// /// *Algorithm 2* (*AUX*) is used if `left + right` is large but `min(left, right)` is small enough to
-// /// fit onto a stack buffer. The `min(left, right)` elements are copied onto the buffer, `memmove`
-// /// is applied to the others, and the ones on the buffer are moved back into the hole on the
-// /// opposite side of where they originated.
-// ///
-// /// Algorithms that can be vectorized outperform the above once `left + right` becomes large enough.
-// /// *Algorithm 1* can be vectorized by chunking and performing many rounds at once, but there are too
-// /// few rounds on average until `left + right` is enormous, and the worst case of a single
-// /// round is always there. Instead, *algorithm 3* (*GM*) utilizes repeated swapping of
-// /// `min(left, right)` elements until a smaller rotate problem is left.
-// ///
-// /// ```text
-// ///                                  mid
-// ///              left = 11           |  right = 4
-// /// [ 5  6  7  8: 9 10 11 12 13 14 15* 1  2  3  4]   swap
-// ///                        └────────┴/\┴────────┘
-// ///                        ┌────────┬~~┬────────┐
-// /// [ 5  .  .  .  .  . 11  1 ~~~~~~ 4 12 13 14 15]
-// ///
-// /// [ 5  .  7  1  2  3  4  8  9 10 11 12 ~~~~~ 15    swap
-// ///            └────────┴/\┴────────┘
-// ///            ┌────────┬~~┬────────┐
-// /// [ 5  .  7  8: 9  . 11: 1 ~~~~~~ 4*12  .  . 15
-// /// we cannot swap any more, but a smaller rotation problem is left to solve
-// /// ```
-// ///
-// /// when `left < right` the swapping happens from the left instead.
-// pub unsafe fn ptr_harmony_rotate<T>(mut left: usize, mut mid: *mut T, mut right: usize) {
-//     type BufType = [usize; 32];
-
-//     // if T::IS_ZST {
-//     // return;
-//     // }
-
-//     let t_size = std::mem::size_of::<T>();
-
-//     loop {
-//         if right <= 1 || left <= 1 {
-//             ptr_edge_rotate(left, mid, right);
-//             return;
-//         }
-
-//         let start = mid.sub(left);
-//
-//         if left == right {
-//             ptr::swap_nonoverlapping(start, mid, left);
-//         }
-
-//         let size = left + right;
-
-//         if t_size <= std::mem::size_of::<usize>() {
-//             if size <= 14 {
-//                 ptr_direct_rotate(left, mid, right);
-//             } else if size <= 24 {
-//                 if left < right {
-//                     ptr_reversal_rotate(left, mid, right);
-//                 } else {
-//                     ptr_direct_rotate(left, mid, right);
-//                 }
-//             } else if size < 40 {
-//                 ptr_reversal_rotate(left, mid, right);
-//             }
-//         } else {
-//         }
-//     }
-// }
-
-/// # Default (Stable) rotation
-///
-/// Rotates the range `[mid-left, mid+right)` such that the element at `mid` becomes the first
-/// element. Equivalently, rotates the range `left` elements to the left or `right` elements to the
-/// right.
-///
-/// ## Safety
-///
-/// The specified range must be valid for reading and writing.
-///
-/// ## Algorithm
-///
-/// *Algorithm 1* (*Direct*) is used for small values of `left + right` or for large `T`. The elements
-/// are moved into their final positions one at a time starting at `mid - left` and advancing by `right`
-/// steps modulo `left + right`, such that only one temporary is needed. Eventually, we arrive back at
-/// `mid - left`. However, if `gcd(left + right, right)` is not 1, the above steps skipped over
-/// elements. For example:
-///
-/// ```text
-///                            mid
-///           left = 9         |    right = 6
-/// [ 1  2  3  4  5  6: 7  8  9*10 11 12 13 14 15]                      // round
-///   └─────────────────┐
-/// [ ✘  2  .  .  .  6  1  8  .  .  .  .  .  . 15] [ 7]
-///                                       ┌──────────┘
-///                     _                 ↓
-/// [ ✘  2  .  .  .  6  1  8  .  .  . 12  7 14 15] [13]
-///            ┌─────────────────────────────────────┘
-///            ↓        _                 _
-/// [ ✘  2  3 13  5  6  1  8  .  .  . 12  7 14 15] [ 4]
-///                              ┌───────────────────┘
-///            _        _        ↓        _
-/// [ ✘  2  3 13  5  6  1  8  9  4 11 12  7 14 15] [10]
-///   ┌──────────────────────────────────────────────┘
-///   ↓        _        _        _        _
-/// [10  2  3 13  5  6  1  8  9  4 11 12  7 14 15]                      // round
-///      |        |        |        |        └──────────────────╮
-///      |        |        |        └──────────────────╮        ┆
-///      |        |        └─────────────────┐         ┆        ┆
-///      |        └─────────────────┐        ┆         ┆        ┆
-///      └─────────────────┐        ┆        ┆         ┆        ┆
-/// ~─────────────╮        ┆        ┆        ┆         ┆        ┆
-/// ~────╮        ┆        ┆        ┆        ┆         ┆        ┆
-///   _  ↓     _  ↓     _  ↓     _  ↓     _  ↓      _  ↓     _  ↓
-/// [10 11  3 13 14  6  1  2  9  4  5 12  7  8 15][10 11  3 13 14...    // round
-///         |        |        |        |        └──────────────────╮
-///         |        |        |        └──────────────────╮        ┆
-///         |        |        └─────────────────┐         ┆        ┆
-///         |        └─────────────────┐        ┆         ┆        ┆
-///         └─────────────────┐        ┆        ┆         ┆        ┆
-/// ~────────────────╮        ┆        ┆        ┆         ┆        ┆
-/// ~───────╮        ┆        ┆        ┆        ┆         ┆        ┆
-///   _  _  ↓  _  _  ↓  _  _  ↓  _  _  ↓  _  _  ↓   _  _  ↓  _  _  ↓
-/// [10 11 12 13 14 15: 1  2  3* 4  5  6  7  8  9][10 11 12 13 14 15...
-/// ```
-///
-/// Fortunately, the number of skipped over elements between finalized elements is always equal, so
-/// we can just offset our starting position and do more rounds (the total number of rounds is the
-/// `gcd(left + right, right)` value). The end result is that all elements are finalized once and
-/// only once.
-///
-/// *Algorithm 2* (*AUX*) is used if `left + right` is large but `min(left, right)` is small enough to
-/// fit onto a stack buffer. The `min(left, right)` elements are copied onto the buffer, `memmove`
-/// is applied to the others, and the ones on the buffer are moved back into the hole on the
-/// opposite side of where they originated.
-///
-/// Algorithms that can be vectorized outperform the above once `left + right` becomes large enough.
-/// *Algorithm 1* can be vectorized by chunking and performing many rounds at once, but there are too
-/// few rounds on average until `left + right` is enormous, and the worst case of a single
-/// round is always there. Instead, *algorithm 3* (*GM*) utilizes repeated swapping of
-/// `min(left, right)` elements until a smaller rotate problem is left.
-///
-/// ```text
-///                                  mid
-///              left = 11           |  right = 4
-/// [ 5  6  7  8: 9 10 11 12 13 14 15* 1  2  3  4]   swap
-///                        └────────┴/\┴────────┘
-///                        ┌────────┬~~┬────────┐
-/// [ 5  .  .  .  .  . 11  1 ~~~~~~ 4 12 13 14 15]
-///
-/// [ 5  .  7  1  2  3  4  8  9 10 11 12 ~~~~~ 15    swap
-///            └────────┴/\┴────────┘
-///            ┌────────┬~~┬────────┐
-/// [ 5  .  7  8: 9  . 11: 1 ~~~~~~ 4*12  .  . 15
-/// we cannot swap any more, but a smaller rotation problem is left to solve
-/// ```
-///
-/// when `left < right` the swapping happens from the left instead.
-pub unsafe fn stable_ptr_rotate<T>(mut left: usize, mut mid: *mut T, mut right: usize) {
-    //Taken from https://github.com/rust-lang/rust/blob/11d96b59307b1702fffe871bfc2d0145d070881e/library/core/src/slice/rotate.rs .
-
-    type BufType = [usize; 32];
-
-    // if T::IS_ZST {
-    // return;
-    // }
-
-    loop {
-        // N.B. the below algorithms can fail if these cases are not checked
-        if (right == 0) || (left == 0) {
-            return;
-        }
-
-        if (left + right < 24) || (std::mem::size_of::<T>() > std::mem::size_of::<[usize; 4]>()) {
-            // Algorithm 1
-            // Microbenchmarks indicate that the average performance for random shifts is better all
-            // the way until about `left + right == 32`, but the worst case performance breaks even
-            // around 16. 24 was chosen as middle ground. If the size of `T` is larger than 4
-            // `usize`s, this algorithm also outperforms other algorithms.
-            // SAFETY: callers must ensure `mid - left` is valid for reading and writing.
-            let x = unsafe { mid.sub(left) };
-            // beginning of first round
-            // SAFETY: see previous comment.
-            let mut tmp: T = unsafe { x.read() };
-            let mut i = right;
-            // `gcd` can be found before hand by calculating `gcd(left + right, right)`,
-            // but it is faster to do one loop which calculates the gcd as a side effect, then
-            // doing the rest of the chunk
-            let mut gcd = right;
-            // benchmarks reveal that it is faster to swap temporaries all the way through instead
-            // of reading one temporary once, copying backwards, and then writing that temporary at
-            // the very end. This is possibly due to the fact that swapping or replacing temporaries
-            // uses only one memory address in the loop instead of needing to manage two.
-            loop {
-                // [long-safety-expl]
-                // SAFETY: callers must ensure `[left, left+mid+right)` are all valid for reading and
-                // writing.
-                //
-                // - `i` start with `right` so `mid-left <= x+i = x+right = mid-left+right < mid+right`
-                // - `i <= left+right-1` is always true
-                //   - if `i < left`, `right` is added so `i < left+right` and on the next
-                //     iteration `left` is removed from `i` so it doesn't go further
-                //   - if `i >= left`, `left` is removed immediately and so it doesn't go further.
-                // - overflows cannot happen for `i` since the function's safety contract ask for
-                //   `mid+right-1 = x+left+right` to be valid for writing
-                // - underflows cannot happen because `i` must be bigger or equal to `left` for
-                //   a subtraction of `left` to happen.
-                //
-                // So `x+i` is valid for reading and writing if the caller respected the contract
-                tmp = unsafe { x.add(i).replace(tmp) };
-                // instead of incrementing `i` and then checking if it is outside the bounds, we
-                // check if `i` will go outside the bounds on the next increment. This prevents
-                // any wrapping of pointers or `usize`.
-                if i >= left {
-                    i -= left;
-                    if i == 0 {
-                        // end of first round
-                        // SAFETY: tmp has been read from a valid source and x is valid for writing
-                        // according to the caller.
-                        unsafe { x.write(tmp) };
-                        break;
-                    }
-                    // this conditional must be here if `left + right >= 15`
-                    if i < gcd {
-                        gcd = i;
-                    }
-                } else {
-                    i += right;
-                }
-            }
-            // finish the chunk with more rounds
-            for start in 1..gcd {
-                // SAFETY: `gcd` is at most equal to `right` so all values in `1..gcd` are valid for
-                // reading and writing as per the function's safety contract, see [long-safety-expl]
-                // above
-                tmp = unsafe { x.add(start).read() };
-                // [safety-expl-addition]
-                //
-                // Here `start < gcd` so `start < right` so `i < right+right`: `right` being the
-                // greatest common divisor of `(left+right, right)` means that `left = right` so
-                // `i < left+right` so `x+i = mid-left+i` is always valid for reading and writing
-                // according to the function's safety contract.
-                i = start + right;
-                loop {
-                    // SAFETY: see [long-safety-expl] and [safety-expl-addition]
-                    tmp = unsafe { x.add(i).replace(tmp) };
-                    if i >= left {
-                        i -= left;
-                        if i == start {
-                            // SAFETY: see [long-safety-expl] and [safety-expl-addition]
-                            unsafe { x.add(start).write(tmp) };
-                            break;
-                        }
-                    } else {
-                        i += right;
-                    }
-                }
-            }
-            return;
-        // `T` is not a zero-sized type, so it's okay to divide by its size.
-        } else if cmp::min(left, right) <= std::mem::size_of::<BufType>() / std::mem::size_of::<T>()
-        {
-            // Algorithm 2
-            // The `[T; 0]` here is to ensure this is appropriately aligned for T
-            let mut rawarray = MaybeUninit::<(BufType, [T; 0])>::uninit();
-            let buf = rawarray.as_mut_ptr() as *mut T;
-            // SAFETY: `mid-left <= mid-left+right < mid+right`
-            let dim = unsafe { mid.sub(left).add(right) };
-            if left <= right {
-                // SAFETY:
-                //
-                // 1) The `else if` condition about the sizes ensures `[mid-left; left]` will fit in
-                //    `buf` without overflow and `buf` was created just above and so cannot be
-                //    overlapped with any value of `[mid-left; left]`
-                // 2) [mid-left, mid+right) are all valid for reading and writing and we don't care
-                //    about overlaps here.
-                // 3) The `if` condition about `left <= right` ensures writing `left` elements to
-                //    `dim = mid-left+right` is valid because:
-                //    - `buf` is valid and `left` elements were written in it in 1)
-                //    - `dim+left = mid-left+right+left = mid+right` and we write `[dim, dim+left)`
-                unsafe {
-                    // 1)
-                    ptr::copy_nonoverlapping(mid.sub(left), buf, left);
-                    // 2)
-                    ptr::copy(mid, mid.sub(left), right);
-                    // 3)
-                    ptr::copy_nonoverlapping(buf, dim, left);
-                }
-            } else {
-                // SAFETY: same reasoning as above but with `left` and `right` reversed
-                unsafe {
-                    ptr::copy_nonoverlapping(mid, buf, right);
-                    ptr::copy(mid.sub(left), dim, left);
-                    ptr::copy_nonoverlapping(buf, mid.sub(left), right);
-                }
-            }
-            return;
-        } else if left >= right {
-            // Algorithm 3
-            //
-            //           left = 9         mid    right = 6
-            // [ 1  2  3  4  5  6  7  8  9,10 11 12 13 14 15]
-            //            └──────────────┴──┬──────────────┐
-            //    l = 3  mid                |    r = 6     |
-            // [ 1  2  3,10 11 12 13 14 15  4  5  6  7  8  9]
-            //
-            // There is an alternate way of swapping that involves finding where the last swap
-            // of this algorithm would be, and swapping using that last chunk instead of swapping
-            // adjacent chunks like this algorithm is doing, but this way is still faster.
-            loop {
-                // SAFETY:
-                // `left >= right` so `[mid-right, mid+right)` is valid for reading and writing
-                // Subtracting `right` from `mid` each turn is counterbalanced by the addition and
-                // check after it.
-                unsafe {
-                    ptr::swap_nonoverlapping(mid.sub(right), mid, right);
-                    mid = mid.sub(right);
-                }
-                left -= right;
-                if left < right {
-                    break;
-                }
-            }
-        } else {
-            // Algorithm 3, `left < right`
-            //
-            //  left = 3 mid                    right = 6
-            // [ 1  2  3,10 11 12 13 14 15 ,4  5  6  7  8  9]
-            //   └─────┴──┬─────┐
-            //   l = 3    |     | mid                r = 3
-            // [10 11 12  1  2  3,13 14 15  4  5  6, 7  8  9]
-            //   l = 3    └─────┴──┬─────┐ mid                r = 0
-            // [10 11 12 13 14 15  1  2  3 ,4  5  6  7  8  9],
-            loop {
-                // SAFETY: `[mid-left, mid+left)` is valid for reading and writing because
-                // `left < right` so `mid+left < mid+right`.
-                // Adding `left` to `mid` each turn is counterbalanced by the subtraction and check
-                // after it.
-                unsafe {
-                    ptr::swap_nonoverlapping(mid.sub(left), mid, left);
-                    mid = mid.add(left);
-                }
-                right -= left;
-                if right < left {
-                    break;
-                }
-            }
-        }
+        byte_copy(start, start.add(right), count);
     }
 }
 
@@ -1312,13 +254,12 @@ pub unsafe fn stable_ptr_rotate<T>(mut left: usize, mut mid: *mut T, mut right: 
 mod tests {
     use crate::*;
 
-    fn div(s: usize, diff: usize) -> (usize, usize) {
-        assert!(s >= diff);
-        assert!(s % 2 == diff % 2);
-
-        let r = s / 2 - diff / 2;
-
-        (s - r, r)
+    fn seq_multi<const N: usize>(size: usize) -> Vec<[usize; N]> {
+        let mut v = vec![[0; N]; size];
+        for i in 0..size {
+            v[i] = [i + 1; N];
+        }
+        v
     }
 
     fn seq(size: usize) -> Vec<usize> {
@@ -1329,139 +270,128 @@ mod tests {
         v
     }
 
-    fn prepare(size: usize, diff: usize) -> (Vec<usize>, (usize, *mut usize, usize)) {
-        let (l, r) = div(size, diff);
-        let mut v = seq(size);
+    fn prepare(len: usize, x: usize, y: usize) -> (Vec<usize>, (*mut usize, *mut usize)) {
+        let mut v = seq(len);
 
         unsafe {
-            let p = &v[..].as_mut_ptr().add(l);
-            (v, (l, p.clone(), r))
+            let x = &v[..].as_mut_ptr().add(x - 1);
+            let y = &v[..].as_mut_ptr().add(y - 1);
+
+            (v, (x.clone(), y.clone()))
         }
     }
 
-    fn case(
-        rotate: unsafe fn(left: usize, mid: *mut usize, right: usize),
-        size: usize,
-        diff: usize,
-    ) {
-        let (vec, (l, p, r)) = prepare(size, diff);
+    #[test]
+    fn copy_correct() {
+        let (v, (src, dst)) = prepare(15, 4, 7);
 
-        let mut s = seq(size);
+        unsafe { copy(src, dst, 7) };
 
-        s.rotate_left(l);
-        unsafe { rotate(l, p, r) };
+        let s = vec![1, 2, 3, 4, 5, 6, 4, 5, 6, 7, 8, 9, 10, 14, 15];
+        assert_eq!(v, s);
 
-        assert_eq!(vec, s);
+        let (v, (src, dst)) = prepare(15, 7, 4);
 
-        unsafe { rotate(r, p.sub(diff), l) };
+        unsafe { copy(src, dst, 6) };
 
-        s.rotate_right(l);
-        assert_eq!(vec, s);
-    }
-
-    fn test_correct(rotate_f: unsafe fn(left: usize, mid: *mut usize, right: usize)) {
-        // --empty--
-        case(rotate_f, 0, 0);
-
-        // --empty--
-        case(rotate_f, 2, 0);
-
-        // 1  2  3  4  5  6 (7  8  9)10 11 12 13 14 15
-        case(rotate_f, 15, 3);
-
-        // 1  2  3  4  5 (6  7  8  9 10)11 12 13 14 15
-        case(rotate_f, 15, 5);
-
-        // 1  2  3  4  5  6  7 (8) 9 10 11 12 13 14 15
-        case(rotate_f, 15, 1);
-
-        // 1  2  3  4  5  6  7)(8  9 10 11 12 13 14
-        case(rotate_f, 14, 0);
-
-        // 1  2  3  4  5 (6  7  8  9 10)11 12 13 14 15
-        case(rotate_f, 15, 5);
-
-        // 1  2  3  4 (5  6  7  8  9 10 11)12 13 14 15
-        case(rotate_f, 15, 7);
-
-        // 1 (2  3  4  5  6  7  8  9 10 11 12 13 14)15
-        case(rotate_f, 15, 13);
-
-        //(1  2  3  4  5  6  7  8  9 10 11 12 13 14 15)
-        case(rotate_f, 15, 15);
-
-        //(1  2  3  4  5  6  7  8  9 10 11 12 13 14 15)
-        case(rotate_f, 100_000, 0);
+        let s = vec![1, 2, 3, 7, 8, 9, 10, 11, 12, 10, 11, 12, 13, 14, 15];
+        assert_eq!(v, s);
     }
 
     #[test]
-    // default (stable) rust rotate
-    fn ptr_rotate_correct() {
-        test_correct(stable_ptr_rotate::<usize>);
-    }
+    fn block_copy_correct() {
+        let (v, (src, dst)) = prepare(15, 4, 7);
 
-    // #[test]
-    // fn ptr_harmony_rotate_correct() {
-    //     test_correct(ptr_harmony_rotate::<usize>);
-    // }
+        unsafe { block_copy(src, dst, 7) };
 
-    #[test]
-    fn ptr_edge_rotate_correct() {
-        let rotate_f = ptr_edge_rotate::<usize>;
+        let s = vec![1, 2, 3, 4, 5, 6, 4, 5, 6, 7, 8, 9, 10, 14, 15];
+        assert_eq!(v, s);
 
-        // --empty--
-        case(rotate_f, 0, 0);
+        let (v, (src, dst)) = prepare(15, 7, 4);
 
-        // --empty--
-        case(rotate_f, 2, 0);
+        unsafe { block_copy(src, dst, 6) };
 
-        // 1 (2  3  4  5  6  7  8  9 10 11 12 13 14)15
-        case(rotate_f, 15, 13);
-
-        // 1  2 (3  4  5  6  7  8  9 10 11 12 13)14 15
-        case(rotate_f, 15, 11);
-
-        //(1  2  3  4  5  6  7  8  9 10 11 12 13 14 15)
-        case(rotate_f, 15, 15);
+        let s = vec![1, 2, 3, 7, 8, 9, 10, 11, 12, 10, 11, 12, 13, 14, 15];
+        assert_eq!(v, s);
     }
 
     #[test]
-    fn ptr_reversal_rotate_correct() {
-        test_correct(ptr_reversal_rotate::<usize>);
+    fn byte_copy_correct() {
+        let (v, (src, dst)) = prepare(15, 4, 7);
+
+        unsafe { byte_copy(src, dst, 7) };
+
+        let s = vec![1, 2, 3, 4, 5, 6, 4, 5, 6, 7, 8, 9, 10, 14, 15];
+        assert_eq!(v, s);
+
+        let (v, (src, dst)) = prepare(15, 7, 4);
+
+        unsafe { byte_copy(src, dst, 6) };
+
+        let s = vec![1, 2, 3, 7, 8, 9, 10, 11, 12, 10, 11, 12, 13, 14, 15];
+        assert_eq!(v, s);
+    }
+
+    // Shifts:
+
+    #[test]
+    fn shift_left_correct() {
+        let mut v = seq(15);
+        let mut mid = *unsafe { &v[..].as_mut_ptr().add(3) };
+
+        unsafe { shift_left(1, mid, 7) };
+
+        assert_eq!(v, vec![1, 2, 4, 5, 6, 7, 8, 9, 10, 10, 11, 12, 13, 14, 15]);
+
+        mid = *unsafe { &v[..].as_mut_ptr().add(2) };
+
+        unsafe { shift_left(1, mid, 7) };
+
+        assert_eq!(v, vec![1, 4, 5, 6, 7, 8, 9, 10, 10, 10, 11, 12, 13, 14, 15]);
+
+        v = seq(15);
+        let mut mid = *unsafe { &v[..].as_mut_ptr().add(3) };
+
+        unsafe { shift_left(1, mid, 7) };
+
+        assert_eq!(v, vec![1, 2, 4, 5, 6, 7, 8, 9, 10, 10, 11, 12, 13, 14, 15]);
+
+        mid = *unsafe { &v[..].as_mut_ptr().add(2) };
+
+        unsafe { shift_left(1, mid, 7) };
+
+        assert_eq!(v, vec![1, 4, 5, 6, 7, 8, 9, 10, 10, 10, 11, 12, 13, 14, 15]);
     }
 
     #[test]
-    fn ptr_block_reversal_rotate_correct() {
-        test_correct(ptr_block_reversal_rotate::<usize>);
+    fn shift_right_correct() {
+        let mut v = seq(15);
+        let mut src = *unsafe { &v[..].as_mut_ptr().add(3) };
+
+        unsafe { shift_right(7, src.add(7), 1) };
+
+        assert_eq!(v, vec![1, 2, 3, 4, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15]);
+
+        src = *unsafe { &v[..].as_mut_ptr().add(4) };
+
+        unsafe { shift_right(7, src.add(7), 1) };
+
+        assert_eq!(v, vec![1, 2, 3, 4, 4, 4, 5, 6, 7, 8, 9, 10, 13, 14, 15]);
     }
 
     #[test]
-    fn ptr_piston_rotate_rec_correct() {
-        test_correct(ptr_piston_rotate_rec::<usize>);
-    }
+    fn shift_correct() {
+        let mut v = seq_multi::<20>(15);
+        let mut src = *unsafe { &v[..].as_mut_ptr().add(1) };
 
-    #[test]
-    fn ptr_piston_rotate_correct() {
-        test_correct(ptr_piston_rotate::<usize>);
-    }
+        unsafe { shift_left(1, src, 14) };
 
-    #[test]
-    fn ptr_contrev_rotate_correct() {
-        test_correct(ptr_contrev_rotate::<usize>);
-    }
+        assert_eq!(v[0..13], seq_multi::<20>(14)[1..14]);
 
-    #[test]
-    fn ptr_gen_contrev_rotate_correct() {
-        test_correct(ptr_block_contrev_rotate::<usize>);
-    }
+        v = seq_multi::<20>(15);
+        src = *&v[..].as_mut_ptr();
 
-    #[test]
-    fn ptr_direct_rotate_correct() {
-        test_correct(ptr_direct_rotate::<usize>);
-    }
-
-    #[test]
-    fn ptr_helix_rotate_correct() {
-        test_correct(ptr_helix_rotate::<usize>);
+        unsafe { shift_right(14, src.add(14), 1) };
+        assert_eq!(v[1..14], seq_multi::<20>(14)[0..13]);
     }
 }
